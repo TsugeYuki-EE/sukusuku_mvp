@@ -1,10 +1,14 @@
 #include <M5Unified.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
+#include <BLEAdvertising.h>
 #include <SD.h>
 #include <time.h>
 
+#define DEVICE_ID "NODE02"
+
 BLEScan* pBLEScan;
+BLEAdvertising* pAdvertising;
 TaskHandle_t bleTaskHandle;
 
 portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -14,79 +18,94 @@ portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
 // =========================
 volatile int stepCount = 0;
 
-float gravity = 1.0f;
-float filtered = 0.0f;
-float prevFiltered = 0.0f;
-
-bool rising = false;
-
-unsigned long lastStepMillis = 0;
-
-const float ALPHA = 0.92f;
-
-const float STEP_THRESHOLD = 0.18f;
-
-const unsigned long STEP_INTERVAL = 300;
-
 // =========================
 // BLE
 // =========================
 volatile int latestRSSI = -100;
-
 volatile float distanceMeter = -1;
+
+// =========================
+// 複数ノード管理
+// =========================
+struct DeviceInfo {
+    String id;
+    int rssi;
+    float distance;
+    unsigned long lastSeen;
+};
+
+DeviceInfo devices[20];
+int deviceCount = 0;
 
 // =========================
 // SD / CSV
 // =========================
 char csvFileName[32] = "";
 unsigned long lastCSVMillis = 0;
-const unsigned long CSV_INTERVAL = 10000;  // 10秒
+const unsigned long CSV_INTERVAL = 10000;
 
+// =========================
+// SD
+// =========================
 void initSDCard()
 {
-    if (!SD.begin(4)) {  // M5Stack CoreS3のSDカード対応ピン
+    if (!SD.begin(4)) {
         Serial.println("SD card initialization failed");
         return;
     }
+
     Serial.println("SD card initialized");
 }
 
 void createNewCSVFile()
 {
-    // タイムスタンプ付きのファイル名を生成
     time_t now = time(nullptr);
     struct tm* timeinfo = localtime(&now);
-    
-    sprintf(csvFileName, "/data_%04d%02d%02d_%02d%02d%02d.csv",
+
+    sprintf(csvFileName,
+            "/data_%04d%02d%02d_%02d%02d%02d.csv",
             timeinfo->tm_year + 1900,
             timeinfo->tm_mon + 1,
             timeinfo->tm_mday,
             timeinfo->tm_hour,
             timeinfo->tm_min,
             timeinfo->tm_sec);
-    
-    // ファイルを作成してヘッダーを書き込み
+
     File file = SD.open(csvFileName, FILE_WRITE);
+
     if (file) {
+
         file.println("Timestamp,Steps,Distance(m)");
         file.close();
-        Serial.printf("New CSV file created: %s\n", csvFileName);
+
+        Serial.printf(
+            "New CSV file created: %s\n",
+            csvFileName
+        );
     }
 }
 
-void saveDataToCSV(unsigned long timestamp, int steps, float distance)
+void saveDataToCSV(
+    unsigned long timestamp,
+    int steps,
+    float distance)
 {
-    if (csvFileName[0] == '\0') {
-        return;  // ファイル名がまだ設定されていない
-    }
-    
-    File file = SD.open(csvFileName, FILE_APPEND);
+    if (csvFileName[0] == '\0')
+        return;
+
+    File file =
+        SD.open(csvFileName, FILE_APPEND);
+
     if (file) {
-        file.printf("%lu,%d,%.2f\n", timestamp, steps, distance);
+
+        file.printf(
+            "%lu,%d,%.2f\n",
+            timestamp,
+            steps,
+            distance
+        );
+
         file.close();
-        Serial.printf("Data saved to CSV: %lu, %d, %.2f\n", timestamp, steps, distance);
-    } else {
-        Serial.println("Failed to open CSV file");
     }
 }
 
@@ -97,47 +116,102 @@ float calculateDistance(int rssi)
 {
     int txPower = -59;
 
-    if (rssi == 0) return -1;
+    if (rssi == 0)
+        return -1;
 
-    float ratio = rssi * 1.0 / txPower;
+    float ratio =
+        rssi * 1.0 / txPower;
 
     if (ratio < 1.0) {
+
         return pow(ratio, 10);
     }
 
-    return 0.89976 * pow(ratio, 7.7095)
-            + 0.111;
+    return
+        0.89976 *
+        pow(ratio, 7.7095)
+        + 0.111;
+}
+
+// =========================
+// ノード更新
+// =========================
+void updateDevice(
+    String id,
+    int rssi)
+{
+    float distance =
+        calculateDistance(rssi);
+
+    for (int i = 0; i < deviceCount; i++) {
+
+        if (devices[i].id == id) {
+
+            devices[i].rssi = rssi;
+            devices[i].distance = distance;
+            devices[i].lastSeen = millis();
+
+            return;
+        }
+    }
+
+    if (deviceCount < 20) {
+
+        devices[deviceCount].id = id;
+        devices[deviceCount].rssi = rssi;
+        devices[deviceCount].distance = distance;
+        devices[deviceCount].lastSeen = millis();
+
+        deviceCount++;
+    }
 }
 
 // =========================
 // BLE callback
 // =========================
-class MyCallbacks
-: public BLEAdvertisedDeviceCallbacks {
+class MyCallbacks :
+    public BLEAdvertisedDeviceCallbacks {
 
     void onResult(
-        BLEAdvertisedDevice device
-    ) {
-
+        BLEAdvertisedDevice device)
+    {
         String name =
             device.getName().c_str();
 
-        if (name == "M5_BEACON") {
+        if (!name.startsWith("NODE"))
+            return;
 
-            int rssi = device.getRSSI();
-            float distance = calculateDistance(rssi);
+        if (name == DEVICE_ID)
+            return;
 
-            portENTER_CRITICAL(&sharedStateMux);
-            latestRSSI = rssi;
-            distanceMeter = distance;
-            portEXIT_CRITICAL(&sharedStateMux);
-        }
+        int rssi =
+            device.getRSSI();
+
+        float distance =
+            calculateDistance(rssi);
+
+        updateDevice(name, rssi);
+
+        portENTER_CRITICAL(
+            &sharedStateMux);
+
+        latestRSSI = rssi;
+        distanceMeter = distance;
+
+        portEXIT_CRITICAL(
+            &sharedStateMux);
+
+        Serial.printf(
+            "%s RSSI=%d Dist=%.2f\n",
+            name.c_str(),
+            rssi,
+            distance
+        );
     }
 };
 
 // =========================
 // BLE task
-// Core1
 // =========================
 void bleTask(void *arg)
 {
@@ -157,40 +231,71 @@ void bleTask(void *arg)
 }
 
 // =========================
-// UI / I2C task
-// Core1
-// =========================
 // UI
 // =========================
 void drawUI()
 {
-    M5.Display.fillScreen(TFT_NAVY);
+    M5.Display.fillScreen(
+        TFT_NAVY);
 
-    M5.Display.setTextColor(WHITE);
+    M5.Display.setTextColor(
+        WHITE);
 
-    M5.Display.setTextSize(6);
+    M5.Display.setTextSize(5);
 
-    M5.Display.setCursor(20, 60);
-    M5.Display.println("TARO");
+    M5.Display.setCursor(20, 20);
+    M5.Display.println(DEVICE_ID);
 
     M5.Display.setTextSize(3);
 
-    M5.Display.setCursor(20, 140);
+    M5.Display.setCursor(20, 90);
+
     M5.Display.printf(
         "STEP: %d",
         stepCount
     );
 
-    // Battery level at bottom right (small)
-    int battery = M5.Power.getBatteryLevel();
+    int y = 140;
+
     M5.Display.setTextSize(2);
-    M5.Display.setTextColor(TFT_YELLOW);
-    
-    int x = M5.Display.width() - 100;
-    int y = M5.Display.height() - 40;
-    
-    M5.Display.setCursor(x, y);
-    M5.Display.printf("BAT: %d%%", battery);
+
+    for (int i = 0; i < deviceCount; i++) {
+
+        if (
+            millis()
+            - devices[i].lastSeen
+            > 10000)
+            continue;
+
+        M5.Display.setCursor(
+            20,
+            y
+        );
+
+        M5.Display.printf(
+            "%s %.1fm",
+            devices[i].id.c_str(),
+            devices[i].distance
+        );
+
+        y += 25;
+    }
+
+    int battery =
+        M5.Power.getBatteryLevel();
+
+    M5.Display.setTextColor(
+        TFT_YELLOW);
+
+    M5.Display.setCursor(
+        M5.Display.width() - 110,
+        M5.Display.height() - 30
+    );
+
+    M5.Display.printf(
+        "%d%%",
+        battery
+    );
 }
 
 // =========================
@@ -199,8 +304,10 @@ void drawUI()
 void setup()
 {
     auto cfg = M5.config();
+
     cfg.serial_baudrate = 115200;
     cfg.clear_display = true;
+
     M5.begin(cfg);
 
     Serial.begin(115200);
@@ -209,15 +316,31 @@ void setup()
 
     M5.Display.setRotation(1);
 
-    // SD Card init
     initSDCard();
-    
-    // Create new CSV file
     createNewCSVFile();
 
     // BLE
-    BLEDevice::init("");
+    BLEDevice::init(
+        DEVICE_ID
+    );
 
+    // Advertising
+    pAdvertising =
+        BLEDevice::getAdvertising();
+
+    BLEAdvertisementData advData;
+
+    advData.setName(
+        DEVICE_ID
+    );
+
+    pAdvertising->setAdvertisementData(
+        advData
+    );
+
+    pAdvertising->start();
+
+    // Scan
     pBLEScan =
         BLEDevice::getScan();
 
@@ -226,12 +349,9 @@ void setup()
     );
 
     pBLEScan->setActiveScan(true);
-
     pBLEScan->setInterval(100);
-
     pBLEScan->setWindow(80);
 
-    // BLE scan to Core1
     xTaskCreatePinnedToCore(
         bleTask,
         "BLE",
@@ -245,65 +365,92 @@ void setup()
 
 // =========================
 // loop
-// Core1: I2C / IMU / UI
 // =========================
 void loop()
 {
     static float gravity = 1.0f;
     static float filtered = 0.0f;
     static float prevFiltered = 0.0f;
+
     static bool rising = false;
+
     static unsigned long lastStepMillis = 0;
+
     static unsigned long lastUI = 0;
-    static bool initialUIShown = false;
+
+    static bool calibrated = false;
 
     const float ALPHA = 0.92f;
     const float STEP_THRESHOLD = 0.18f;
     const unsigned long STEP_INTERVAL = 300;
 
-    // 起動直後の静止状態を使って重力をならす
-    static bool calibrated = false;
     if (!calibrated) {
+
         for (int i = 0; i < 40; i++) {
+
             float ax, ay, az;
-            M5.Imu.getAccelData(&ax, &ay, &az);
-            float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
-            gravity = gravity * 0.9f + accelMagnitude * 0.1f;
+
+            M5.Imu.getAccelData(
+                &ax,
+                &ay,
+                &az
+            );
+
+            float accelMagnitude =
+                sqrt(
+                    ax * ax +
+                    ay * ay +
+                    az * az
+                );
+
+            gravity =
+                gravity * 0.9f +
+                accelMagnitude * 0.1f;
+
             delay(20);
         }
+
         calibrated = true;
     }
 
     float ax, ay, az;
 
-    // IMU取得
     M5.Imu.getAccelData(
         &ax,
         &ay,
         &az
     );
 
-    float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
+    float accelMagnitude =
+        sqrt(
+            ax * ax +
+            ay * ay +
+            az * az
+        );
 
-    // 重力除去
     gravity =
         gravity * ALPHA +
         accelMagnitude * (1.0f - ALPHA);
 
-    filtered = accelMagnitude - gravity;
+    filtered =
+        accelMagnitude - gravity;
 
-    bool currentRising = filtered > prevFiltered;
+    bool currentRising =
+        filtered > prevFiltered;
 
-    // Peak
     if (
         rising &&
         !currentRising &&
         prevFiltered > STEP_THRESHOLD
     ) {
 
-        unsigned long now = millis();
+        unsigned long now =
+            millis();
 
-        if (now - lastStepMillis > STEP_INTERVAL) {
+        if (
+            now - lastStepMillis >
+            STEP_INTERVAL
+        ) {
 
             stepCount++;
 
@@ -319,27 +466,41 @@ void loop()
     rising = currentRising;
     prevFiltered = filtered;
 
-    if (!initialUIShown) {
-        drawUI();
-        lastUI = millis();
-        initialUIShown = true;
-    }
+    unsigned long now =
+        millis();
 
-    // CSV保存（10秒ごと）
-    unsigned long now = millis();
-    if (now - lastCSVMillis > CSV_INTERVAL) {
+    if (
+        now - lastCSVMillis >
+        CSV_INTERVAL
+    ) {
+
         float distanceSnapshot;
-        portENTER_CRITICAL(&sharedStateMux);
-        distanceSnapshot = distanceMeter;
-        portEXIT_CRITICAL(&sharedStateMux);
-        
-        saveDataToCSV(now / 1000, stepCount, distanceSnapshot);
+
+        portENTER_CRITICAL(
+            &sharedStateMux);
+
+        distanceSnapshot =
+            distanceMeter;
+
+        portEXIT_CRITICAL(
+            &sharedStateMux);
+
+        saveDataToCSV(
+            now / 1000,
+            stepCount,
+            distanceSnapshot
+        );
+
         lastCSVMillis = now;
     }
 
-    // UI update every 5 seconds
-    if (millis() - lastUI > 5000) {
+    if (
+        millis() - lastUI >
+        5000
+    ) {
+
         drawUI();
+
         lastUI = millis();
     }
 
